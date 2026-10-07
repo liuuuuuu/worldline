@@ -8,8 +8,8 @@ export interface Phase {
 
 export const PHASES: readonly Phase[] = [
   { id: 'P0', name: '地基', status: 'done' },
-  { id: 'P1', name: '数据层', status: 'active' },
-  { id: 'P2', name: '球体', status: 'todo' },
+  { id: 'P1', name: '数据层', status: 'done' },
+  { id: 'P2', name: '球体', status: 'active' },
   { id: 'P3', name: '图钉', status: 'todo' },
   { id: 'P4', name: '音频', status: 'todo' },
   { id: 'P5', name: '降落', status: 'todo' },
