@@ -84,6 +84,15 @@ export default function PhaseBoard() {
             <button
               type="button"
               onClick={() => {
+                navigate('/dev/pins');
+              }}
+              style={navButton}
+            >
+              L3 交互层 → /dev/pins
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 navigate('/dev/globe');
               }}
               style={navButton}

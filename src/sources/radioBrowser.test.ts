@@ -350,6 +350,161 @@ describe('discoverStations', () => {
   });
 });
 
+describe('by-country selection', () => {
+  function baseOptions() {
+    return {
+      store: createMemoryStore(),
+      mirrors: ['https://mirror.test'],
+      sleep: noSleep,
+      attemptsPerMirror: 1,
+      now: () => 1_000,
+      selection: 'by-country' as const,
+      countryCount: 3,
+      perCountry: 20,
+      countryConcurrency: 1,
+      maxStations: 1000,
+    };
+  }
+
+  const COUNTRIES = [
+    { name: 'United States', iso_3166_1: 'US', stationcount: 8422 },
+    { name: 'Germany', iso_3166_1: 'DE', stationcount: 6482 },
+    { name: 'France', iso_3166_1: 'FR', stationcount: 3880 },
+    { name: 'Russia', iso_3166_1: 'RU', stationcount: 3256 },
+  ];
+
+  /** Descending votes by directory size, so ordering is unambiguous. */
+  const VOTES: Record<string, number> = { US: 400, DE: 300, FR: 200, RU: 100 };
+
+  /** Routes the country list and per-country station requests. */
+  function routedFetch(stationsPerCountry: (code: string) => unknown[]) {
+    return vi.fn<typeof fetch>((input) => {
+      const url = new URL(requestUrl(input));
+      if (url.pathname.endsWith('/json/countries')) {
+        return Promise.resolve(okResponse(COUNTRIES));
+      }
+      const code = url.searchParams.get('countrycode') ?? '??';
+      return Promise.resolve(okResponse(stationsPerCountry(code)));
+    });
+  }
+
+  it('asks the largest countries first, then one request each', async () => {
+    const fetchImpl = routedFetch((code) => [
+      rawStation({ stationuuid: `${code}-1`, votes: VOTES[code] ?? 0 }),
+    ]);
+
+    const { stations, meta } = await discoverStations({ ...baseOptions(), fetchImpl });
+
+    // Ordering is by votes across the merged set, not by the order requested.
+    expect(stations.map((station) => station.id)).toEqual(['US-1', 'DE-1', 'FR-1']);
+    expect(meta.totalPages).toBe(3);
+    expect(meta.failedPages).toBe(0);
+
+    const requested = fetchImpl.mock.calls.map((call) => requestUrl(call[0]));
+    expect(requested[0]).toContain('/json/countries');
+    expect(requested.filter((url) => url.includes('countrycode=US'))).toHaveLength(1);
+    // Russia is 4th by station count and the quota is 3, so it must not be asked.
+    expect(requested.some((url) => url.includes('countrycode=RU'))).toBe(false);
+  });
+
+  it('deduplicates stations that appear under more than one country', async () => {
+    const shared = rawStation({ stationuuid: 'shared', votes: 900 });
+    const fetchImpl = routedFetch((code) => [
+      shared,
+      rawStation({ stationuuid: `${code}-own`, votes: VOTES[code] ?? 0 }),
+    ]);
+
+    const { stations } = await discoverStations({ ...baseOptions(), fetchImpl });
+
+    expect(stations.filter((station) => station.id === 'shared')).toHaveLength(1);
+    expect(stations).toHaveLength(4);
+  });
+
+  it('keeps going when one country fails', async () => {
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = new URL(requestUrl(input));
+      if (url.pathname.endsWith('/json/countries')) {
+        return Promise.resolve(okResponse(COUNTRIES));
+      }
+      const code = url.searchParams.get('countrycode');
+      if (code === 'DE') return Promise.reject(new Error('Germany is down'));
+      return Promise.resolve(
+        okResponse([
+          rawStation({ stationuuid: `${code ?? 'X'}-1`, votes: VOTES[code ?? ''] ?? 0 }),
+        ]),
+      );
+    });
+
+    const { stations, meta } = await discoverStations({ ...baseOptions(), fetchImpl });
+
+    expect(stations.map((station) => station.id)).toEqual(['US-1', 'FR-1']);
+    expect(meta.failedPages).toBe(1);
+    expect(meta.totalPages).toBe(3);
+  });
+
+  it('fails only when every country fails', async () => {
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = new URL(requestUrl(input));
+      if (url.pathname.endsWith('/json/countries')) {
+        return Promise.resolve(okResponse(COUNTRIES));
+      }
+      return Promise.reject(new Error('all down'));
+    });
+
+    const error = await discoverStations({ ...baseOptions(), fetchImpl }).catch(
+      (thrown: unknown) => thrown,
+    );
+
+    expect(error).toBeInstanceOf(SourceError);
+    expect((error as SourceError).code).toBe('no-mirror');
+  });
+
+  it('caches the country list and each country separately', async () => {
+    const fetchImpl = routedFetch((code) => [rawStation({ stationuuid: `${code}-1` })]);
+    const store = createMemoryStore();
+
+    const first = await discoverStations({ ...baseOptions(), store, fetchImpl });
+    const callsAfterFirst = fetchImpl.mock.calls.length;
+    const second = await discoverStations({ ...baseOptions(), store, fetchImpl });
+
+    expect(first.meta.fromCache).toBe(false);
+    expect(second.meta.fromCache).toBe(true);
+    expect(fetchImpl.mock.calls.length).toBe(callsAfterFirst);
+    expect(second.stations).toHaveLength(3);
+  });
+
+  it('errors out rather than returning an empty globe when the country list is unusable', async () => {
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = new URL(requestUrl(input));
+      if (url.pathname.endsWith('/json/countries')) {
+        return Promise.resolve(okResponse([]));
+      }
+      return Promise.resolve(okResponse([]));
+    });
+
+    await expect(discoverStations({ ...baseOptions(), fetchImpl })).rejects.toBeInstanceOf(
+      SourceError,
+    );
+  });
+
+  it('reports progress per country, not per station', async () => {
+    const fetchImpl = routedFetch((code) => [rawStation({ stationuuid: `${code}-1` })]);
+    const seen: number[] = [];
+
+    await discoverStations({
+      ...baseOptions(),
+      fetchImpl,
+      onPage: (_stations, progress) => {
+        seen.push(progress.target);
+      },
+    });
+
+    // target = countryCount * perCountry
+    expect(seen.every((target) => target === 60)).toBe(true);
+    expect(seen).toHaveLength(3);
+  });
+});
+
 describe('createRadioBrowserSource', () => {
   it('declares itself as an audio source that does not require a coordinate', () => {
     const source = createRadioBrowserSource();

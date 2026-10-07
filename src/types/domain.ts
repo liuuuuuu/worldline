@@ -44,6 +44,15 @@ export interface Station {
   geo: GeoPoint | null;
 }
 
+/** A country in the directory, with its total station count. */
+export interface Country {
+  /** ISO 3166-1 alpha-2, uppercase. */
+  code: string;
+  name: string;
+  /** Stations in the directory, geolocated or not. */
+  stationCount: number;
+}
+
 /** How a payload list was obtained. Surfaced in the UI and in PROGRESS.md. */
 export interface DiscoveryMeta {
   sourceId: string;

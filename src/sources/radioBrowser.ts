@@ -26,8 +26,12 @@
 
 import { readThrough, createDefaultStore, DEFAULT_TTL_MS, type KeyValueStore } from './cache';
 import { fetchJsonFromMirrors, type HttpDeps } from './http';
-import { parseRadioBrowserStations, type RawRadioBrowserStation } from './schemas';
-import type { DiscoveryMeta, Station, StationDiscovery } from '../types/domain';
+import {
+  parseRadioBrowserCountries,
+  parseRadioBrowserStations,
+  type RawRadioBrowserStation,
+} from './schemas';
+import type { Country, DiscoveryMeta, Station, StationDiscovery } from '../types/domain';
 import type { AudioStreamPayload, DiscoverContext, GeoPoint, Source } from '../types/source';
 import { SourceError } from '../types/source';
 
@@ -67,6 +71,38 @@ export const DEFAULT_CONCURRENCY = 1;
 export const DEFAULT_PAGE_TIMEOUT_MS = 45_000;
 
 export const CACHE_KEY_PREFIX = 'radio-browser:page';
+export const CACHE_KEY_COUNTRIES = 'radio-browser:countries';
+export const CACHE_KEY_COUNTRY_PREFIX = 'radio-browser:country';
+
+/**
+ * By-country selection defaults.
+ *
+ * Measured 2026-10-07: a 20-row, single-country request is ~25 KB and takes
+ * 1.3–4.1s, against ~30s for a 250-row global page. So asking 80 countries for
+ * 20 stations each is roughly the same wall-clock cost as the global paging it
+ * replaces — while guaranteeing that the globe is populated everywhere instead
+ * of only where internet radio happens to be popular.
+ */
+export const DEFAULT_COUNTRY_COUNT = 80;
+export const DEFAULT_PER_COUNTRY = 20;
+/**
+ * Countries in flight at once.
+ *
+ * Higher than the global page concurrency (1) because these responses are an
+ * order of magnitude smaller: the throttling that made parallel large pages fail
+ * does not bite at 25 KB.
+ */
+export const DEFAULT_COUNTRY_CONCURRENCY = 3;
+
+/**
+ * How the directory is sampled.
+ *
+ * - `top` — highest-voted stations overall. Fast and reliable, but the result is
+ *   a Europe/US blob: the directory itself is skewed, so no sort order fixes it.
+ * - `by-country` — a fixed quota per country. Slower and more requests, but the
+ *   globe ends up genuinely covered.
+ */
+export type StationSelection = 'top' | 'by-country';
 
 export interface PageProgress {
   loaded: number;
@@ -81,6 +117,14 @@ export interface DiscoverStationsOptions extends HttpDeps {
   pageSize?: number;
   /** Pages fetched in parallel. */
   concurrency?: number;
+  /** Which stations to keep. Defaults to `top`. */
+  selection?: StationSelection;
+  /** `by-country`: how many countries to sample. */
+  countryCount?: number;
+  /** `by-country`: how many stations to take from each. */
+  perCountry?: number;
+  /** `by-country`: how many country requests to run at once. */
+  countryConcurrency?: number;
   /** Ask the API for geolocated stations only. Default true. */
   geoOnly?: boolean;
   /** Exclude stations whose last health check failed. Default true. */
@@ -94,25 +138,8 @@ export interface DiscoverStationsOptions extends HttpDeps {
   attemptsPerMirror?: number;
   onAttemptError?: (endpoint: string, attempt: number, error: unknown) => void;
   onStaleFallback?: (error: unknown) => void;
-  /** Called as each page lands, for progressive rendering. */
+  /** Called as each page or country lands, for progressive rendering. */
   onPage?: (stations: readonly Station[], progress: PageProgress) => void;
-}
-
-/** Exactly what we cache per page, so a cache hit reports where the data came from. */
-interface CachedPage {
-  stations: Station[];
-  endpoint: string;
-  rejected: number;
-  fetchedAt: number;
-}
-
-interface PageOutcome {
-  stations: Station[];
-  endpoint: string;
-  fromCache: boolean;
-  stale: boolean;
-  fetchedAt: number;
-  rejected: number;
 }
 
 function buildSearchPath(options: {
@@ -126,6 +153,24 @@ function buildSearchPath(options: {
     reverse: 'true',
     limit: String(options.limit),
     offset: String(options.offset),
+  });
+  if (options.geoOnly) params.set('has_geo_info', 'true');
+  if (options.hideBroken) params.set('hidebroken', 'true');
+  return `/json/stations/search?${params.toString()}`;
+}
+
+function buildCountryPath(options: {
+  countryCode: string;
+  limit: number;
+  geoOnly: boolean;
+  hideBroken: boolean;
+}): string {
+  const params = new URLSearchParams({
+    order: 'votes',
+    reverse: 'true',
+    limit: String(options.limit),
+    offset: '0',
+    countrycode: options.countryCode,
   });
   if (options.geoOnly) params.set('has_geo_info', 'true');
   if (options.hideBroken) params.set('hidebroken', 'true');
@@ -213,12 +258,221 @@ export async function mapWithConcurrency<T, R>(
 }
 
 /**
- * Fetch and normalise the station directory as a sequence of cached pages.
+ * Fetch and normalise the station directory.
+ *
+ * Two selection strategies, sharing one aggregation path:
+ *
+ * - `top`: page through the globally highest-voted stations.
+ * - `by-country`: ask each of the N largest countries for its top K. More
+ *   requests, but the pins end up spread across the globe rather than piled into
+ *   Europe and North America.
  *
  * Resolves with whatever it managed to collect. `meta.failedPages` being
  * non-zero means the list is incomplete — the caller should say so rather than
  * pretend the globe is fully populated.
  */
+/**
+ * Everything the page and country loaders need, resolved once.
+ *
+ * Threading a dozen options through every helper would be worse than one object
+ * that is built in exactly one place.
+ */
+interface FetchContext {
+  store: KeyValueStore;
+  mirrors: readonly string[];
+  ttlMs: number;
+  now: () => number;
+  timeoutMs: number;
+  attemptsPerMirror: number;
+  perCountry: number;
+  geoOnly: boolean;
+  hideBroken: boolean;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  onAttemptError?: (endpoint: string, attempt: number, error: unknown) => void;
+  onStaleFallback?: (error: unknown) => void;
+}
+
+/** The shared shape of one HTTP-backed unit of work. */
+interface FetchOutcome {
+  stations: Station[];
+  /** Records dropped during parsing because they had no usable identity. */
+  rejected: number;
+  endpoint: string;
+  fromCache: boolean;
+  stale: boolean;
+  fetchedAt: number;
+}
+
+function httpArgs(ctx: FetchContext, path: string): Parameters<typeof fetchJsonFromMirrors>[0] {
+  return {
+    mirrors: ctx.mirrors,
+    path,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
+    timeoutMs: ctx.timeoutMs,
+    attemptsPerMirror: ctx.attemptsPerMirror,
+    ...(ctx.onAttemptError ? { onAttemptError: ctx.onAttemptError } : {}),
+    ...(ctx.fetchImpl ? { fetchImpl: ctx.fetchImpl } : {}),
+    ...(ctx.sleep ? { sleep: ctx.sleep } : {}),
+  };
+}
+
+function normaliseStations(raw: unknown): { stations: Station[]; rejected: number } {
+  const parsed = parseRadioBrowserStations(raw);
+  return {
+    stations: parsed.stations.map(toStation).filter((station) => station.streamUrl !== ''),
+    rejected: parsed.rejected,
+  };
+}
+
+interface CachedCountryList {
+  countries: Country[];
+  endpoint: string;
+  fetchedAt: number;
+}
+
+/**
+ * The directory's country list, largest first.
+ *
+ * Cached separately from station data because it is small (14 KB) and changes
+ * very slowly, and because every `by-country` load needs it first.
+ */
+async function loadCountryList(ctx: FetchContext): Promise<{
+  countries: Country[];
+  endpoint: string;
+  fromCache: boolean;
+  stale: boolean;
+  fetchedAt: number;
+}> {
+  const result = await readThrough<CachedCountryList>({
+    store: ctx.store,
+    key: CACHE_KEY_COUNTRIES,
+    ttlMs: ctx.ttlMs,
+    now: ctx.now,
+    ...(ctx.onStaleFallback ? { onStaleFallback: ctx.onStaleFallback } : {}),
+    load: async () => {
+      const response = await fetchJsonFromMirrors(httpArgs(ctx, '/json/countries'));
+      const parsed = parseRadioBrowserCountries(response.body);
+
+      const countries = parsed.countries
+        .map((raw) => ({
+          code: raw.iso_3166_1.trim().toUpperCase(),
+          name: raw.name.trim() || raw.iso_3166_1.trim().toUpperCase(),
+          stationCount: raw.stationcount,
+        }))
+        .filter((country) => country.code !== '')
+        .sort((a, b) => b.stationCount - a.stationCount || a.code.localeCompare(b.code));
+
+      if (countries.length === 0) {
+        throw new SourceError('bad-response', 'Country list decoded to zero entries', {
+          endpoint: response.endpoint,
+        });
+      }
+
+      return { countries, endpoint: response.endpoint, fetchedAt: ctx.now() };
+    },
+  });
+
+  return {
+    countries: result.value.countries,
+    endpoint: result.value.endpoint,
+    fromCache: result.fromCache,
+    stale: result.stale,
+    fetchedAt: result.value.fetchedAt,
+  };
+}
+
+/** One country's top stations, cached independently. */
+async function loadCountryStations(countryCode: string, ctx: FetchContext): Promise<FetchOutcome> {
+  const cacheKey = `${CACHE_KEY_COUNTRY_PREFIX}:${countryCode}:limit=${ctx.perCountry}:geo=${String(ctx.geoOnly)}:hidebroken=${String(ctx.hideBroken)}`;
+
+  const result = await readThrough<{
+    stations: Station[];
+    rejected: number;
+    endpoint: string;
+    fetchedAt: number;
+  }>({
+    store: ctx.store,
+    key: cacheKey,
+    ttlMs: ctx.ttlMs,
+    now: ctx.now,
+    ...(ctx.onStaleFallback ? { onStaleFallback: ctx.onStaleFallback } : {}),
+    load: async () => {
+      const path = buildCountryPath({
+        countryCode,
+        limit: ctx.perCountry,
+        geoOnly: ctx.geoOnly,
+        hideBroken: ctx.hideBroken,
+      });
+      const response = await fetchJsonFromMirrors(httpArgs(ctx, path));
+      const normalised = normaliseStations(response.body);
+      return {
+        stations: normalised.stations,
+        rejected: normalised.rejected,
+        endpoint: response.endpoint,
+        fetchedAt: ctx.now(),
+      };
+    },
+  });
+
+  return {
+    stations: result.value.stations,
+    rejected: result.value.rejected,
+    endpoint: result.value.endpoint,
+    fromCache: result.fromCache,
+    stale: result.stale,
+    fetchedAt: result.value.fetchedAt,
+  };
+}
+
+/** One page of the globally highest-voted stations, cached independently. */
+async function loadPageByOffset(
+  offset: number,
+  pageSize: number,
+  ctx: FetchContext,
+): Promise<FetchOutcome> {
+  const cacheKey = `${CACHE_KEY_PREFIX}:limit=${pageSize}:offset=${offset}:geo=${String(ctx.geoOnly)}:hidebroken=${String(ctx.hideBroken)}`;
+
+  const result = await readThrough<{
+    stations: Station[];
+    rejected: number;
+    endpoint: string;
+    fetchedAt: number;
+  }>({
+    store: ctx.store,
+    key: cacheKey,
+    ttlMs: ctx.ttlMs,
+    now: ctx.now,
+    ...(ctx.onStaleFallback ? { onStaleFallback: ctx.onStaleFallback } : {}),
+    load: async () => {
+      const path = buildSearchPath({
+        limit: pageSize,
+        offset,
+        geoOnly: ctx.geoOnly,
+        hideBroken: ctx.hideBroken,
+      });
+      const response = await fetchJsonFromMirrors(httpArgs(ctx, path));
+      const normalised = normaliseStations(response.body);
+      return {
+        stations: normalised.stations,
+        rejected: normalised.rejected,
+        endpoint: response.endpoint,
+        fetchedAt: ctx.now(),
+      };
+    },
+  });
+
+  return {
+    stations: result.value.stations,
+    rejected: result.value.rejected,
+    endpoint: result.value.endpoint,
+    fromCache: result.fromCache,
+    stale: result.stale,
+    fetchedAt: result.value.fetchedAt,
+  };
+}
+
 export async function discoverStations(
   options: DiscoverStationsOptions = {},
 ): Promise<StationDiscovery> {
@@ -226,6 +480,10 @@ export async function discoverStations(
     maxStations = DEFAULT_MAX_STATIONS,
     pageSize = DEFAULT_PAGE_SIZE,
     concurrency = DEFAULT_CONCURRENCY,
+    selection = 'top',
+    countryCount = DEFAULT_COUNTRY_COUNT,
+    perCountry = DEFAULT_PER_COUNTRY,
+    countryConcurrency = DEFAULT_COUNTRY_CONCURRENCY,
     geoOnly = true,
     hideBroken = true,
     signal,
@@ -242,90 +500,96 @@ export async function discoverStations(
     sleep,
   } = options;
 
-  const totalPages = Math.max(1, Math.ceil(maxStations / pageSize));
-  const offsets = Array.from({ length: totalPages }, (_, index) => index * pageSize);
+  const ctx: FetchContext = {
+    store,
+    mirrors,
+    ttlMs,
+    now,
+    timeoutMs,
+    attemptsPerMirror,
+    perCountry,
+    geoOnly,
+    hideBroken,
+    ...(signal ? { signal } : {}),
+    ...(fetchImpl ? { fetchImpl } : {}),
+    ...(sleep ? { sleep } : {}),
+    ...(onAttemptError ? { onAttemptError } : {}),
+    ...(onStaleFallback ? { onStaleFallback } : {}),
+  };
 
   const byId = new Map<string, Station>();
-  let failedPages = 0;
+  let failedUnits = 0;
   let rejected = 0;
   let endpoint = '';
   let allFromCache = true;
   let anyStale = false;
   let fetchedAt = 0;
   let completed = 0;
+  // Assigned by whichever strategy runs; no initial value is ever read.
+  let totalUnits: number;
 
-  const loadPage = async (offset: number): Promise<PageOutcome> => {
-    const cacheKey = `${CACHE_KEY_PREFIX}:limit=${pageSize}:offset=${offset}:geo=${String(geoOnly)}:hidebroken=${String(hideBroken)}`;
-    const path = buildSearchPath({ limit: pageSize, offset, geoOnly, hideBroken });
+  // The progress denominator differs by strategy: stations for one, countries
+  // for the other.
+  const target = selection === 'by-country' ? countryCount * perCountry : maxStations;
 
-    const result = await readThrough<CachedPage>({
-      store,
-      key: cacheKey,
-      ttlMs,
-      now,
-      ...(onStaleFallback ? { onStaleFallback } : {}),
-      load: async () => {
-        const response = await fetchJsonFromMirrors({
-          mirrors,
-          path,
-          ...(signal ? { signal } : {}),
-          timeoutMs,
-          attemptsPerMirror,
-          ...(onAttemptError ? { onAttemptError } : {}),
-          ...(fetchImpl ? { fetchImpl } : {}),
-          ...(sleep ? { sleep } : {}),
-        });
-
-        const parsed = parseRadioBrowserStations(response.body);
-        return {
-          stations: parsed.stations.map(toStation).filter((station) => station.streamUrl !== ''),
-          endpoint: response.endpoint,
-          rejected: parsed.rejected,
-          fetchedAt: now(),
-        };
-      },
-    });
-
-    return {
-      stations: result.value.stations,
-      endpoint: result.value.endpoint,
-      fromCache: result.fromCache,
-      stale: result.stale,
-      fetchedAt: result.value.fetchedAt,
-      rejected: result.value.rejected,
-    };
-  };
-
-  await mapWithConcurrency(offsets, concurrency, async (offset) => {
-    let outcome: PageOutcome;
-    try {
-      outcome = await loadPage(offset);
-    } catch (error) {
-      // One dead page must not sink the load. Aborting, however, is terminal.
-      if (signal?.aborted) throw error;
-      failedPages += 1;
-      completed += 1;
-      onPage?.([...byId.values()], { loaded: byId.size, target: maxStations, failed: failedPages });
-      return;
-    }
-
+  const absorb = (outcome: FetchOutcome): void => {
     for (const station of outcome.stations) {
       if (!byId.has(station.id)) byId.set(station.id, station);
     }
-
     if (endpoint === '') endpoint = outcome.endpoint;
     allFromCache = allFromCache && outcome.fromCache;
     anyStale = anyStale || outcome.stale;
     fetchedAt = Math.max(fetchedAt, outcome.fetchedAt);
     rejected += outcome.rejected;
     completed += 1;
+    onPage?.([...byId.values()], { loaded: byId.size, target, failed: failedUnits });
+  };
 
-    onPage?.([...byId.values()], { loaded: byId.size, target: maxStations, failed: failedPages });
-  });
+  const recordFailure = (): void => {
+    failedUnits += 1;
+    completed += 1;
+    onPage?.([...byId.values()], { loaded: byId.size, target, failed: failedUnits });
+  };
 
-  // Every page failed and we collected nothing — that is a real failure.
-  if (completed > 0 && completed === failedPages) {
-    throw new SourceError('no-mirror', `All ${failedPages} page(s) failed`);
+  if (selection === 'by-country') {
+    const list = await loadCountryList(ctx);
+    // Fold the country list into the metadata but not into the progress count —
+    // it is a lookup, not a unit of station data.
+    endpoint = list.endpoint;
+    allFromCache = list.fromCache;
+    anyStale = list.stale;
+    fetchedAt = Math.max(fetchedAt, list.fetchedAt);
+
+    const chosen = list.countries.slice(0, countryCount);
+    totalUnits = chosen.length;
+
+    await mapWithConcurrency(chosen, countryConcurrency, async (country) => {
+      try {
+        absorb(await loadCountryStations(country.code, ctx));
+      } catch (error) {
+        // One dead country must not sink the load. Aborting is terminal.
+        if (signal?.aborted) throw error;
+        recordFailure();
+      }
+    });
+  } else {
+    const pages = Math.max(1, Math.ceil(maxStations / pageSize));
+    totalUnits = pages;
+    const offsets = Array.from({ length: pages }, (_, index) => index * pageSize);
+
+    await mapWithConcurrency(offsets, concurrency, async (offset) => {
+      try {
+        absorb(await loadPageByOffset(offset, pageSize, ctx));
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        recordFailure();
+      }
+    });
+  }
+
+  // Every request failed and we collected nothing — that is a real failure.
+  if (completed > 0 && completed === failedUnits) {
+    throw new SourceError('no-mirror', `All ${failedUnits} request(s) failed`);
   }
 
   const stations = [...byId.values()].sort(compareStations).slice(0, maxStations);
@@ -336,8 +600,8 @@ export async function discoverStations(
     fromCache: allFromCache,
     stale: anyStale,
     fetchedAt,
-    failedPages,
-    totalPages,
+    failedPages: failedUnits,
+    totalPages: totalUnits,
     rejectedStations: rejected,
   };
 

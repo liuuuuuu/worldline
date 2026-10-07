@@ -14,6 +14,7 @@ import { useHashRoute } from './dev/router';
  */
 const DataPage = lazy(() => import('./dev/DataPage'));
 const GlobePage = lazy(() => import('./dev/GlobePage'));
+const PinsPage = lazy(() => import('./dev/PinsPage'));
 
 function RouteFallback() {
   return (
@@ -49,6 +50,14 @@ export default function App() {
     return (
       <Suspense fallback={<RouteFallback />}>
         <GlobePage />
+      </Suspense>
+    );
+  }
+
+  if (route === '/dev/pins') {
+    return (
+      <Suspense fallback={<RouteFallback />}>
+        <PinsPage />
       </Suspense>
     );
   }

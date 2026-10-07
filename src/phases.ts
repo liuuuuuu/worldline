@@ -10,8 +10,8 @@ export const PHASES: readonly Phase[] = [
   { id: 'P0', name: '地基', status: 'done' },
   { id: 'P1', name: '数据层', status: 'done' },
   { id: 'P2', name: '球体', status: 'done' },
-  { id: 'P3', name: '图钉', status: 'active' },
-  { id: 'P4', name: '音频', status: 'todo' },
+  { id: 'P3', name: '图钉', status: 'done' },
+  { id: 'P4', name: '音频', status: 'active' },
   { id: 'P5', name: '降落', status: 'todo' },
   { id: 'P6', name: '收尾', status: 'todo' },
 ];

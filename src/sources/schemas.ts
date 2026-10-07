@@ -95,6 +95,40 @@ export const radioBrowserStationSchema = z.object({
 
 export type RawRadioBrowserStation = z.infer<typeof radioBrowserStationSchema>;
 
+export const radioBrowserCountrySchema = z.object({
+  name: looseString,
+  iso_3166_1: looseString,
+  stationcount: looseInt,
+});
+
+export type RawRadioBrowserCountry = z.infer<typeof radioBrowserCountrySchema>;
+
+export interface ParsedCountries {
+  countries: RawRadioBrowserCountry[];
+  rejected: number;
+}
+
+/** Parse `/json/countries`, skipping rows with no usable country code. */
+export function parseRadioBrowserCountries(raw: unknown): ParsedCountries {
+  if (!Array.isArray(raw)) {
+    return { countries: [], rejected: 0 };
+  }
+
+  const countries: RawRadioBrowserCountry[] = [];
+  let rejected = 0;
+
+  for (const item of raw) {
+    const parsed = radioBrowserCountrySchema.safeParse(item);
+    if (parsed.success && parsed.data.iso_3166_1.trim() !== '') {
+      countries.push(parsed.data);
+    } else {
+      rejected += 1;
+    }
+  }
+
+  return { countries, rejected };
+}
+
 export interface ParsedStations {
   stations: RawRadioBrowserStation[];
   /** Records dropped because they had no usable `stationuuid`. */

@@ -2,23 +2,34 @@
  * The 3D stage as a React component.
  *
  * Thin on purpose: all three.js work lives in `createGlobeStage`. This component
- * mounts it, tracks coarse status (loading / ready / error) and overlays the
- * vignette and grain.
+ * mounts it, tracks coarse status (loading / ready / error), forwards pins and
+ * hover events, and overlays the vignette and grain.
  *
- * Every state write happens inside a promise callback. Setting state
+ * Callbacks and the station list are routed through refs so that an inline arrow
+ * function from the parent cannot tear down and rebuild the whole WebGL scene.
+ * Every state write happens inside a promise callback — setting state
  * synchronously in an effect body triggers a cascading render, and the scene
- * setup genuinely is asynchronous anyway — the land geometry arrives after the
- * first frame.
+ * setup is genuinely asynchronous anyway.
  */
 
-import { useEffect, useRef, useState } from 'react';
-import { createGlobeStage, type SceneStats } from './createGlobeStage';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  createGlobeStage,
+  type GlobeStage,
+  type HoverInfo,
+  type SceneStats,
+} from './createGlobeStage';
+import type { Station } from '../types/domain';
 
-export type { SceneStats };
+export type { HoverInfo, SceneStats };
 
 export interface GlobeSceneProps {
   /** Reported roughly twice a second. */
   onStats?: (stats: SceneStats) => void;
+  onHover?: (info: HoverInfo | null) => void;
+  onPick?: (station: Station) => void;
+  /** Pins to render. Replaced in place when the reference changes. */
+  stations?: readonly Station[];
   /** Idle spin, radians per second. Zero freezes the globe. */
   idleSpin?: number;
   /** Vertical camera angle limits, in degrees. */
@@ -29,12 +40,40 @@ const DEFAULT_ELEVATION: readonly [number, number] = [6, 58];
 
 export default function GlobeScene({
   onStats,
+  onHover,
+  onPick,
+  stations,
   idleSpin = 0.03,
   elevationRange = DEFAULT_ELEVATION,
 }: GlobeSceneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<GlobeStage | null>(null);
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Latest callbacks, read at call time so the scene effect never re-runs.
+  const onStatsRef = useRef(onStats);
+  const onHoverRef = useRef(onHover);
+  const onPickRef = useRef(onPick);
+  const stationsRef = useRef<readonly Station[]>(stations ?? []);
+
+  useEffect(() => {
+    onStatsRef.current = onStats;
+    onHoverRef.current = onHover;
+    onPickRef.current = onPick;
+  }, [onStats, onHover, onPick]);
+
+  const handleStats = useCallback((stats: SceneStats) => {
+    onStatsRef.current?.(stats);
+  }, []);
+
+  const handleHover = useCallback((info: HoverInfo | null) => {
+    onHoverRef.current?.(info);
+  }, []);
+
+  const handlePick = useCallback((station: Station) => {
+    onPickRef.current?.(station);
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -48,7 +87,9 @@ export default function GlobeScene({
         createGlobeStage(container, {
           idleSpin,
           elevationRange,
-          ...(onStats ? { onStats } : {}),
+          onStats: handleStats,
+          onHover: handleHover,
+          onPick: handlePick,
         }),
       )
       .then((stage) => {
@@ -56,9 +97,13 @@ export default function GlobeScene({
           stage.dispose();
           return null;
         }
+        stageRef.current = stage;
+        // Pins may have arrived before the stage existed.
+        stage.setStations(stationsRef.current);
         // Wrap rather than assign the method: an unbound `dispose` would be
         // called with the wrong `this`.
         teardown = () => {
+          stageRef.current = null;
           stage.dispose();
         };
         // `skinReady` resolves to void, so wrap it — otherwise the next link
@@ -79,7 +124,13 @@ export default function GlobeScene({
       disposed = true;
       teardown?.();
     };
-  }, [idleSpin, elevationRange, onStats]);
+  }, [idleSpin, elevationRange, handleStats, handleHover, handlePick]);
+
+  // Push pin changes into the live stage without rebuilding it.
+  useEffect(() => {
+    stationsRef.current = stations ?? [];
+    stageRef.current?.setStations(stationsRef.current);
+  }, [stations]);
 
   return (
     <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
