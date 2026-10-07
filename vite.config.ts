@@ -17,6 +17,11 @@ export default defineConfig(({ mode }) => ({
   build: {
     target: 'es2022',
     sourcemap: true,
+    // `three.js` is a single ~550 KB dependency. It is already isolated behind a
+    // lazy route, so it never reaches the initial load (the shell is ~70 KB
+    // gzip). Raising the limit rather than leaving a warning that always fires —
+    // a permanent warning trains you to ignore warnings.
+    chunkSizeWarningLimit: 700,
   },
   test: {
     environment: 'jsdom',

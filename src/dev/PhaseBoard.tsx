@@ -1,6 +1,16 @@
 import { PHASES, STATUS_MARK } from '../phases';
 import { navigate } from './router';
 
+const navButton: React.CSSProperties = {
+  background: 'transparent',
+  border: '1px solid var(--wl-brass)',
+  color: 'var(--wl-brass)',
+  borderRadius: 6,
+  padding: '8px 14px',
+  fontSize: 13,
+  cursor: 'pointer',
+};
+
 /** Landing page: where the project stands, and doors into the layer dev pages. */
 export default function PhaseBoard() {
   return (
@@ -70,23 +80,26 @@ export default function PhaseBoard() {
           >
             分层验证页
           </p>
-          <button
-            type="button"
-            onClick={() => {
-              navigate('/dev/data');
-            }}
-            style={{
-              background: 'transparent',
-              border: '1px solid var(--wl-brass)',
-              color: 'var(--wl-brass)',
-              borderRadius: 6,
-              padding: '8px 14px',
-              fontSize: 13,
-              cursor: 'pointer',
-            }}
-          >
-            L1 数据层 → /dev/data
-          </button>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              onClick={() => {
+                navigate('/dev/globe');
+              }}
+              style={navButton}
+            >
+              L2 场景层 → /dev/globe
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                navigate('/dev/data');
+              }}
+              style={navButton}
+            >
+              L1 数据层 → /dev/data
+            </button>
+          </div>
         </nav>
 
         <p style={{ margin: '28px 0 0', color: 'var(--wl-text-dim)', fontSize: 13 }}>
