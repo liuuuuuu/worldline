@@ -103,6 +103,39 @@ export const radioBrowserCountrySchema = z.object({
 
 export type RawRadioBrowserCountry = z.infer<typeof radioBrowserCountrySchema>;
 
+/**
+ * `/json/servers` entries.
+ *
+ * The live node list, which turns out to be much shorter than the documented
+ * mirror list — measured 2026-10-07 it returned a single host (`de1`) twice, once
+ * per IP family. So the named mirrors in our fallback list are not "blocked from
+ * this network", they are gone.
+ */
+export const radioBrowserServerSchema = z.object({
+  name: looseString,
+  ip: looseString,
+});
+
+export function parseRadioBrowserServers(raw: unknown): { hosts: string[]; rejected: number } {
+  if (!Array.isArray(raw)) return { hosts: [], rejected: 0 };
+
+  const hosts: string[] = [];
+  let rejected = 0;
+
+  for (const item of raw) {
+    const parsed = radioBrowserServerSchema.safeParse(item);
+    if (!parsed.success || parsed.data.name.trim() === '') {
+      rejected += 1;
+      continue;
+    }
+    const host = parsed.data.name.trim().toLowerCase();
+    // The same host appears once per IP family; dedupe by name.
+    if (!hosts.includes(host)) hosts.push(host);
+  }
+
+  return { hosts, rejected };
+}
+
 export interface ParsedCountries {
   countries: RawRadioBrowserCountry[];
   rejected: number;

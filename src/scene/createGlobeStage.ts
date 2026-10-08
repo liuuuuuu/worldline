@@ -119,9 +119,14 @@ export function createGlobeStage(container: HTMLElement, options: GlobeStageOpti
   scene.add(lighting.key, lighting.fill);
 
   // --- Globe -------------------------------------------------------------
-  // Start with a paper-only skin so the page shows something immediately;
-  // waiting on 545 KB of coastline data would make it feel broken.
-  const placeholderSkin = toTexture(createPaperTexture([]));
+  // Start with a paper-only skin so the page shows something immediately.
+  //
+  // Deliberately tiny: this texture is on screen for well under a second, and a
+  // full 4096x2048 draw here would block the main thread long enough to delay
+  // the station pins — which is the thing the user is actually waiting for.
+  const placeholderSkin = toTexture(
+    createPaperTexture([], { width: 512, height: 256, noise: { dots: 400 } }),
+  );
   const globe = createGlobe({ skin: placeholderSkin, wood: woodTexture });
   scene.add(globe.root);
 
@@ -329,18 +334,33 @@ export function createGlobeStage(container: HTMLElement, options: GlobeStageOpti
   observer.observe(container);
 
   // --- Land, arriving late ------------------------------------------------
-  const skinReady = loadLandRings().then((polygons) => {
-    const skin = toTexture(createPaperTexture(polygons));
-    skin.wrapS = THREE.ClampToEdgeWrapping;
-    skin.wrapT = THREE.ClampToEdgeWrapping;
-    skin.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const skinReady = loadLandRings().then(
+    (polygons) =>
+      new Promise<void>((resolve) => {
+        /**
+         * Yield one macrotask before drawing the real skin.
+         *
+         * Drawing a 4096x2048 canvas with ~1400 polygons, twice (rim + ink), is
+         * the single most expensive thing at startup — measured at several
+         * seconds of main-thread block. Doing it here rather than in the same
+         * microtask as the fetch lets the first frame render, the station pins
+         * appear, and the scene settle before the CPU is taken away.
+         */
+        setTimeout(() => {
+          const skin = toTexture(createPaperTexture(polygons));
+          skin.wrapS = THREE.ClampToEdgeWrapping;
+          skin.wrapT = THREE.ClampToEdgeWrapping;
+          skin.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
-    const material = globe.sphere.material as THREE.MeshStandardMaterial;
-    const previous = material.map;
-    material.map = skin;
-    material.needsUpdate = true;
-    previous?.dispose();
-  });
+          const material = globe.sphere.material as THREE.MeshStandardMaterial;
+          const previous = material.map;
+          material.map = skin;
+          material.needsUpdate = true;
+          previous?.dispose();
+          resolve();
+        }, 0);
+      }),
+  );
 
   // --- Frame loop ---------------------------------------------------------
   const clock = new THREE.Clock();

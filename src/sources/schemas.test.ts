@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { openMeteoResponseSchema, parseRadioBrowserStations } from './schemas';
+import {
+  openMeteoResponseSchema,
+  parseRadioBrowserCountries,
+  parseRadioBrowserServers,
+  parseRadioBrowserStations,
+} from './schemas';
 
 describe('parseRadioBrowserStations', () => {
   it('parses a well-formed record', () => {
@@ -75,6 +80,66 @@ describe('parseRadioBrowserStations', () => {
   it('returns nothing for a non-array body', () => {
     expect(parseRadioBrowserStations({ error: 'nope' })).toEqual({ stations: [], rejected: 0 });
     expect(parseRadioBrowserStations(null)).toEqual({ stations: [], rejected: 0 });
+  });
+});
+
+describe('parseRadioBrowserServers', () => {
+  it('deduplicates the same host listed once per IP family', () => {
+    const { hosts, rejected } = parseRadioBrowserServers([
+      { name: 'de1.api.radio-browser.info', ip: '91.98.4.78' },
+      { name: 'de1.api.radio-browser.info', ip: '2a01:4f8:1c1d:699::1' },
+    ]);
+
+    expect(hosts).toEqual(['de1.api.radio-browser.info']);
+    expect(rejected).toBe(0);
+  });
+
+  it('skips entries with no host name', () => {
+    const { hosts, rejected } = parseRadioBrowserServers([
+      { name: '', ip: '1.2.3.4' },
+      { ip: '1.2.3.4' },
+      { name: 'ok.example', ip: '1.2.3.4' },
+    ]);
+
+    expect(hosts).toEqual(['ok.example']);
+    expect(rejected).toBe(2);
+  });
+
+  it('lower-cases host names and trims whitespace', () => {
+    const { hosts } = parseRadioBrowserServers([{ name: '  DE1.Example.COM  ', ip: '1.2.3.4' }]);
+    expect(hosts).toEqual(['de1.example.com']);
+  });
+
+  it('returns nothing for a non-array body', () => {
+    expect(parseRadioBrowserServers({ error: 'nope' })).toEqual({ hosts: [], rejected: 0 });
+    expect(parseRadioBrowserServers(null)).toEqual({ hosts: [], rejected: 0 });
+  });
+});
+
+describe('parseRadioBrowserCountries', () => {
+  it('parses a country list', () => {
+    const { countries, rejected } = parseRadioBrowserCountries([
+      { name: 'Andorra', iso_3166_1: 'AD', stationcount: 12 },
+      { name: 'Germany', iso_3166_1: 'DE', stationcount: 6482 },
+    ]);
+
+    expect(countries).toHaveLength(2);
+    expect(countries[1]?.stationcount).toBe(6482);
+    expect(rejected).toBe(0);
+  });
+
+  it('skips rows with no country code', () => {
+    const { countries, rejected } = parseRadioBrowserCountries([
+      { name: 'Nowhere', iso_3166_1: '', stationcount: 3 },
+      { name: 'Somewhere', iso_3166_1: 'XX', stationcount: 3 },
+    ]);
+
+    expect(countries).toHaveLength(1);
+    expect(rejected).toBe(1);
+  });
+
+  it('returns nothing for a non-array body', () => {
+    expect(parseRadioBrowserCountries('nope')).toEqual({ countries: [], rejected: 0 });
   });
 });
 

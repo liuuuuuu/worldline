@@ -2,9 +2,17 @@ import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import { viteSingleFile } from 'vite-plugin-singlefile';
 import { fileURLToPath } from 'node:url';
+import { streamRelay } from './vite-plugin/stream-relay.ts';
 
 export default defineConfig(({ mode }) => ({
-  plugins: [react(), ...(mode === 'single' ? [viteSingleFile()] : [])],
+  plugins: [
+    react(),
+    // Relays http-only streams so a secure-context page can play them.
+    // Set WORLDLINE_STREAM_RELAY=0 to leave it out — the relay's only real cost
+    // is host bandwidth, so the deployer decides.
+    ...(process.env.WORLDLINE_STREAM_RELAY === '0' ? [] : [streamRelay()]),
+    ...(mode === 'single' ? [viteSingleFile()] : []),
+  ],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

@@ -76,6 +76,19 @@ export interface DiscoveryMeta {
    * which is exactly the failure mode schema validation exists to catch.
    */
   rejectedStations?: number;
+  /**
+   * Records dropped because the name was advertising rather than a name.
+   *
+   * Kept separate from `rejectedStations`: that count means "upstream changed
+   * shape", this one means "the directory has junk in it". Conflating them would
+   * hide a schema break inside normal noise.
+   */
+  filteredStations?: number;
+  /**
+   * True when the returned list came from the bundled snapshot rather than the
+   * network — i.e. every mirror was down and the snapshot carried the load.
+   */
+  fromSnapshot?: boolean;
 }
 
 export interface StationDiscovery {

@@ -220,6 +220,22 @@ export function drawPaperMap(
 }
 
 /**
+ * Overrides for `createPaperTexture`.
+ *
+ * Nested groups are partial too — `Partial<PaperTextureOptions>` alone would
+ * still require a caller to restate every field of `noise` just to change one.
+ */
+export interface PaperTextureOverrides {
+  width?: number;
+  height?: number;
+  palette?: Partial<PaperPalette>;
+  graticuleStep?: number;
+  graticuleWidth?: number;
+  coastlineWidth?: number;
+  noise?: Partial<PaperTextureOptions['noise']>;
+}
+
+/**
  * Build the globe skin.
  *
  * `width`/`height` are clamped to at least 2 because a canvas of 0 or 1 pixel
@@ -228,7 +244,7 @@ export function drawPaperMap(
  */
 export function createPaperTexture(
   polygons: readonly PolygonRings[],
-  options: Partial<PaperTextureOptions> = {},
+  options: PaperTextureOverrides = {},
   factory: CanvasFactory = domCanvasFactory,
 ): CanvasLike {
   const resolved: PaperTextureOptions = {

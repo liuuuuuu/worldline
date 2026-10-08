@@ -122,9 +122,17 @@ describe('toStation', () => {
 });
 
 describe('discoverStations', () => {
-  /** Fresh store per test — a shared one would let a cache hit mask the behaviour. */
+  /**
+   * Fresh store per test — a shared one would let a cache hit mask the behaviour.
+   *
+   * `selection: 'top'` is explicit because the product default is `by-country`;
+   * these cases exercise the paging path specifically.
+   */
   function baseOptions() {
     return {
+      selection: 'top' as const,
+      // Hermetic: the bundled snapshot is exercised by its own tests.
+      snapshotUrl: null,
       store: createMemoryStore(),
       mirrors: ['https://mirror.test'],
       sleep: noSleep,
@@ -358,6 +366,7 @@ describe('by-country selection', () => {
       sleep: noSleep,
       attemptsPerMirror: 1,
       now: () => 1_000,
+      snapshotUrl: null,
       selection: 'by-country' as const,
       countryCount: 3,
       perCountry: 20,
@@ -505,6 +514,281 @@ describe('by-country selection', () => {
   });
 });
 
+describe('mirror discovery and stickiness', () => {
+  /** `/json/servers` lists each host once per IP family. */
+  function serverList(hosts: readonly string[]): unknown[] {
+    return hosts.flatMap((host) => [
+      { name: host, ip: '91.98.4.78' },
+      { name: host, ip: '2a01:4f8:1c1d:699::1' },
+    ]);
+  }
+
+  const pageOptions = {
+    selection: 'top' as const,
+    sleep: noSleep,
+    attemptsPerMirror: 1,
+    pageSize: 250,
+    maxStations: 250,
+    snapshotUrl: null,
+    now: () => 1_000,
+  };
+
+  it('discovers live nodes before asking for stations', async () => {
+    const requested: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = requestUrl(input);
+      requested.push(url);
+      if (url.includes('/json/servers')) {
+        return Promise.resolve(okResponse(serverList(['good.example'])));
+      }
+      return Promise.resolve(okResponse([rawStation()]));
+    });
+
+    const { meta } = await discoverStations({
+      ...pageOptions,
+      store: createMemoryStore(),
+      fetchImpl,
+    });
+
+    // The documented mirror list is stale, so the live list must be consulted.
+    expect(requested[0]).toContain('/json/servers');
+    expect(meta.endpoint).toBe('https://good.example');
+  });
+
+  it('does not reorder or discover when the caller pins a mirror list', async () => {
+    const requested: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      requested.push(requestUrl(input));
+      return Promise.resolve(okResponse([rawStation()]));
+    });
+
+    const { meta } = await discoverStations({
+      ...pageOptions,
+      store: createMemoryStore(),
+      mirrors: ['https://pinned.test'],
+      fetchImpl,
+    });
+
+    expect(requested.some((url) => url.includes('/json/servers'))).toBe(false);
+    expect(meta.endpoint).toBe('https://pinned.test');
+  });
+
+  it('remembers the working mirror for the next load', async () => {
+    const store = createMemoryStore();
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = requestUrl(input);
+      if (url.includes('/json/servers')) {
+        return Promise.resolve(okResponse(serverList(['down.example', 'up.example'])));
+      }
+      if (url.startsWith('https://down.example')) {
+        return Promise.reject(new Error('down.example is down'));
+      }
+      return Promise.resolve(okResponse([rawStation()]));
+    });
+
+    await discoverStations({ ...pageOptions, store, fetchImpl });
+
+    expect(await store.get('radio-browser:preferred-mirror')).toMatchObject({
+      endpoint: 'https://up.example',
+    });
+  });
+
+  it('tries the remembered mirror first on the next load', async () => {
+    const store = createMemoryStore();
+    await store.set('radio-browser:preferred-mirror', {
+      endpoint: 'https://up.example',
+      storedAt: 1_000,
+    });
+
+    const stationRequests: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = requestUrl(input);
+      if (url.includes('/json/servers')) {
+        return Promise.resolve(okResponse(serverList(['down.example', 'up.example'])));
+      }
+      stationRequests.push(url);
+      return Promise.resolve(okResponse([rawStation()]));
+    });
+
+    await discoverStations({ ...pageOptions, store, fetchImpl });
+
+    expect(stationRequests[0]).toContain('https://up.example');
+  });
+
+  it('falls back to the static list when discovery fails', async () => {
+    const fetchImpl = vi.fn<typeof fetch>((input) => {
+      const url = requestUrl(input);
+      if (url.includes('/json/servers')) {
+        return Promise.reject(new Error('discovery is down'));
+      }
+      return Promise.resolve(okResponse([rawStation()]));
+    });
+
+    const { stations, meta } = await discoverStations({
+      ...pageOptions,
+      store: createMemoryStore(),
+      fetchImpl,
+    });
+
+    expect(stations).toHaveLength(1);
+    expect(meta.endpoint).toContain('radio-browser.info');
+  });
+});
+
+describe('snapshot fallback', () => {
+  function snapshotFile(records: unknown[]): unknown {
+    return {
+      generatedAt: '2026-10-07T12:00:00.000Z',
+      source: 'test',
+      count: records.length,
+      stations: records,
+    };
+  }
+
+  const base = {
+    selection: 'top' as const,
+    sleep: noSleep,
+    attemptsPerMirror: 1,
+    pageSize: 250,
+    maxStations: 250,
+    mirrors: ['https://mirror.test'],
+    now: () => Date.parse('2026-10-07T12:30:00.000Z'),
+  };
+
+  /** Serves the snapshot path and the station path separately. */
+  function routedFetch(snapshot: unknown, stations: unknown[] | Error) {
+    return vi.fn<typeof fetch>((input) => {
+      const url = requestUrl(input);
+      if (url.includes('snapshot')) return Promise.resolve(okResponse(snapshot));
+      if (stations instanceof Error) return Promise.reject(stations);
+      return Promise.resolve(okResponse(stations));
+    });
+  }
+
+  it('emits snapshot stations before the network answers', async () => {
+    const fetchImpl = routedFetch(
+      snapshotFile([rawStation({ stationuuid: 'from-snapshot', votes: 10 })]),
+      [rawStation({ stationuuid: 'from-network', votes: 20 })],
+    );
+    const emissions: string[][] = [];
+
+    const { stations } = await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: '/snapshot.json',
+      fetchImpl,
+      onPage: (page) => {
+        emissions.push(page.map((station) => station.id));
+      },
+    });
+
+    // First emission is the snapshot alone, so the globe fills immediately.
+    expect(emissions[0]).toEqual(['from-snapshot']);
+    // The final result is live data only — snapshot entries are provisional and
+    // would otherwise accumulate as ghosts across releases.
+    expect(stations.map((station) => station.id)).toEqual(['from-network']);
+  });
+
+  it('shows snapshot and live data together while loading', async () => {
+    const fetchImpl = routedFetch(
+      snapshotFile([rawStation({ stationuuid: 'from-snapshot', votes: 10 })]),
+      [rawStation({ stationuuid: 'from-network', votes: 20 })],
+    );
+    const emissions: string[][] = [];
+
+    await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: '/snapshot.json',
+      fetchImpl,
+      onPage: (page) => {
+        emissions.push(page.map((station) => station.id));
+      },
+    });
+
+    expect(emissions.at(-1)).toEqual(['from-network', 'from-snapshot']);
+  });
+
+  it('falls back to the snapshot when every mirror is down', async () => {
+    const fetchImpl = routedFetch(
+      snapshotFile([rawStation({ stationuuid: 'from-snapshot' })]),
+      new Error('every mirror is down'),
+    );
+
+    const { stations, meta } = await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: '/snapshot.json',
+      fetchImpl,
+    });
+
+    // No throw: a usable globe beats an error screen.
+    expect(stations.map((station) => station.id)).toEqual(['from-snapshot']);
+    expect(meta.fromSnapshot).toBe(true);
+  });
+
+  it('still throws when there is no snapshot to fall back on', async () => {
+    const fetchImpl = routedFetch(snapshotFile([]), new Error('down'));
+
+    const error = await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: '/snapshot.json',
+      fetchImpl,
+    }).catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(SourceError);
+    expect((error as SourceError).code).toBe('no-mirror');
+  });
+
+  it('marks live results as not coming from the snapshot', async () => {
+    const fetchImpl = routedFetch(snapshotFile([rawStation({ stationuuid: 'from-snapshot' })]), [
+      rawStation({ stationuuid: 'from-network' }),
+    ]);
+
+    const { meta } = await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: '/snapshot.json',
+      fetchImpl,
+    });
+
+    expect(meta.fromSnapshot).toBe(false);
+  });
+
+  it('does not fetch the snapshot when it is disabled', async () => {
+    const fetchImpl = routedFetch(snapshotFile([]), [rawStation()]);
+
+    await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: null,
+      fetchImpl,
+    });
+
+    expect(fetchImpl.mock.calls.some((call) => requestUrl(call[0]).includes('snapshot'))).toBe(
+      false,
+    );
+  });
+
+  it('ignores a snapshot whose records are unusable', async () => {
+    // Records missing a stationuuid are dropped by the same parser that guards
+    // live responses, so a broken snapshot degrades to the network path.
+    const fetchImpl = routedFetch(snapshotFile([{ name: 'no uuid' }]), [
+      rawStation({ stationuuid: 'from-network' }),
+    ]);
+
+    const { stations } = await discoverStations({
+      ...base,
+      store: createMemoryStore(),
+      snapshotUrl: '/snapshot.json',
+      fetchImpl,
+    });
+
+    expect(stations.map((station) => station.id)).toEqual(['from-network']);
+  });
+});
+
 describe('createRadioBrowserSource', () => {
   it('declares itself as an audio source that does not require a coordinate', () => {
     const source = createRadioBrowserSource();
@@ -518,6 +802,7 @@ describe('createRadioBrowserSource', () => {
   it('wraps stations into audio-stream payloads carrying their origin', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(okResponse([rawStation()]));
     const source = createRadioBrowserSource({
+      selection: 'top',
       store: createMemoryStore(),
       mirrors: ['https://mirror.test'],
       fetchImpl,

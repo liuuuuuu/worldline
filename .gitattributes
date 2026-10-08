@@ -12,3 +12,7 @@
 *.otf binary
 *.mp4 binary
 *.webm binary
+
+# Generated station snapshot: tracked, but a 991 KB single-line JSON has no
+# useful diff — regenerating it changes the whole line. `npm run snapshot`.
+public/stations.snapshot.json -diff

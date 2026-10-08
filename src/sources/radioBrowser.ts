@@ -28,23 +28,25 @@ import { readThrough, createDefaultStore, DEFAULT_TTL_MS, type KeyValueStore } f
 import { fetchJsonFromMirrors, type HttpDeps } from './http';
 import {
   parseRadioBrowserCountries,
+  parseRadioBrowserServers,
   parseRadioBrowserStations,
   type RawRadioBrowserStation,
 } from './schemas';
 import type { Country, DiscoveryMeta, Station, StationDiscovery } from '../types/domain';
+import { filterSpamStations } from './stationFilter';
+import { DEFAULT_SNAPSHOT_URL, loadSnapshot } from './snapshot';
 import type { AudioStreamPayload, DiscoverContext, GeoPoint, Source } from '../types/source';
 import { SourceError } from '../types/source';
 
 export const SOURCE_ID = 'radio-browser';
 
 /**
- * Tried in order.
+ * Fallback mirror list, tried only when live discovery fails.
  *
- * The official guidance is to hit `all` first, because it is a DNS round-robin
- * across the named nodes. Measured from this network, `all` hangs until the
- * timeout while `de1` answers — and the other named nodes fail *fast* (under
- * 1.5s) when unreachable. Concrete hosts that fail fast beat a round-robin that
- * hangs, so `de1` leads and `all` stays last for networks where it does resolve.
+ * Measured 2026-10-07: `/json/servers` reports **one** live node (`de1`), listed
+ * twice for IPv4 and IPv6. So `nl1` / `at1` / `fi1` / `all` are not blocked from
+ * this network — they no longer exist. This list is kept as a last resort and to
+ * seed the very first discovery request.
  */
 export const RADIO_BROWSER_MIRRORS: readonly string[] = [
   'https://de1.api.radio-browser.info',
@@ -73,6 +75,8 @@ export const DEFAULT_PAGE_TIMEOUT_MS = 45_000;
 export const CACHE_KEY_PREFIX = 'radio-browser:page';
 export const CACHE_KEY_COUNTRIES = 'radio-browser:countries';
 export const CACHE_KEY_COUNTRY_PREFIX = 'radio-browser:country';
+export const CACHE_KEY_SERVERS = 'radio-browser:servers';
+export const CACHE_KEY_PREFERRED_MIRROR = 'radio-browser:preferred-mirror';
 
 /**
  * By-country selection defaults.
@@ -97,10 +101,12 @@ export const DEFAULT_COUNTRY_CONCURRENCY = 3;
 /**
  * How the directory is sampled.
  *
- * - `top` — highest-voted stations overall. Fast and reliable, but the result is
- *   a Europe/US blob: the directory itself is skewed, so no sort order fixes it.
- * - `by-country` — a fixed quota per country. Slower and more requests, but the
- *   globe ends up genuinely covered.
+ * - `by-country` — a fixed quota per country. **The default**, because it is what
+ *   the product actually needs: the globe must be covered. Costs ~150 small
+ *   requests instead of 4 large ones.
+ * - `top` — highest-voted stations overall. Cheaper, but the result is a
+ *   Europe/US blob: the directory itself is skewed, so no sort order fixes it.
+ *   Kept for callers that explicitly want the popular stations.
  */
 export type StationSelection = 'top' | 'by-country';
 
@@ -125,6 +131,14 @@ export interface DiscoverStationsOptions extends HttpDeps {
   perCountry?: number;
   /** `by-country`: how many country requests to run at once. */
   countryConcurrency?: number;
+  /**
+   * Bundled snapshot to show while the live load runs. `null` disables it.
+   *
+   * The snapshot is provisional: it populates the globe in ~100ms, and is
+   * replaced by live data once any arrives. It also serves as the outage
+   * fallback when every mirror is down.
+   */
+  snapshotUrl?: string | null;
   /** Ask the API for geolocated stations only. Default true. */
   geoOnly?: boolean;
   /** Exclude stations whose last health check failed. Default true. */
@@ -279,7 +293,22 @@ export async function mapWithConcurrency<T, R>(
  */
 interface FetchContext {
   store: KeyValueStore;
-  mirrors: readonly string[];
+  /**
+   * The list actually used, best first.
+   *
+   * Mutable: `rememberMirror` moves a working endpoint to the front mid-run so
+   * every later request in the same load skips the dead ones.
+   */
+  mirrors: string[];
+  /** Static list, used to seed discovery and as the last resort. */
+  fallbackMirrors: readonly string[];
+  /**
+   * Whether to ask `/json/servers` and reorder by last-known-good.
+   *
+   * False when the caller pinned an explicit `mirrors` list — supplying one means
+   * "use exactly these", and silently reordering it would be a surprise.
+   */
+  discoverMirrors: boolean;
   ttlMs: number;
   now: () => number;
   timeoutMs: number;
@@ -294,11 +323,22 @@ interface FetchContext {
   onStaleFallback?: (error: unknown) => void;
 }
 
+/** Exactly what we cache per page or per country. */
+interface CachedStations {
+  stations: Station[];
+  rejected: number;
+  filtered: number;
+  endpoint: string;
+  fetchedAt: number;
+}
+
 /** The shared shape of one HTTP-backed unit of work. */
 interface FetchOutcome {
   stations: Station[];
   /** Records dropped during parsing because they had no usable identity. */
   rejected: number;
+  /** Records dropped because the name was advertising rather than a name. */
+  filtered: number;
   endpoint: string;
   fromCache: boolean;
   stale: boolean;
@@ -318,18 +358,107 @@ function httpArgs(ctx: FetchContext, path: string): Parameters<typeof fetchJsonF
   };
 }
 
-function normaliseStations(raw: unknown): { stations: Station[]; rejected: number } {
+function normaliseStations(raw: unknown): {
+  stations: Station[];
+  rejected: number;
+  filtered: number;
+} {
   const parsed = parseRadioBrowserStations(raw);
-  return {
-    stations: parsed.stations.map(toStation).filter((station) => station.streamUrl !== ''),
-    rejected: parsed.rejected,
-  };
+  const playable = parsed.stations.map(toStation).filter((station) => station.streamUrl !== '');
+  const { kept, dropped } = filterSpamStations(playable);
+
+  return { stations: kept, rejected: parsed.rejected, filtered: dropped };
 }
 
 interface CachedCountryList {
   countries: Country[];
   endpoint: string;
   fetchedAt: number;
+}
+
+interface CachedServers {
+  hosts: string[];
+  fetchedAt: number;
+}
+
+interface CachedMirror {
+  endpoint: string;
+  storedAt: number;
+}
+
+function readCachedEndpoint(raw: unknown): string | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const candidate = raw as { endpoint?: unknown };
+  return typeof candidate.endpoint === 'string' && candidate.endpoint !== ''
+    ? candidate.endpoint
+    : null;
+}
+
+/** Live node list from `/json/servers`, cached. */
+async function loadDiscoveredMirrors(ctx: FetchContext): Promise<string[]> {
+  const result = await readThrough<CachedServers>({
+    store: ctx.store,
+    key: CACHE_KEY_SERVERS,
+    ttlMs: ctx.ttlMs,
+    now: ctx.now,
+    load: async () => {
+      const response = await fetchJsonFromMirrors(httpArgs(ctx, '/json/servers'));
+      const parsed = parseRadioBrowserServers(response.body);
+      if (parsed.hosts.length === 0) {
+        throw new SourceError('bad-response', 'Server list is empty', {
+          endpoint: response.endpoint,
+        });
+      }
+      return {
+        hosts: parsed.hosts.map((host) => `https://${host}`),
+        fetchedAt: ctx.now(),
+      };
+    },
+  });
+  return result.value.hosts;
+}
+
+/**
+ * The mirror list to actually use, best first.
+ *
+ * Order: last-known-good, then whatever `/json/servers` reports right now, then
+ * the static fallback. Discovery is what keeps this working as nodes come and
+ * go — the hardcoded list was already stale when it was written.
+ */
+async function resolveMirrors(ctx: FetchContext): Promise<string[]> {
+  if (!ctx.discoverMirrors) return [...ctx.fallbackMirrors];
+
+  const ordered: string[] = [];
+  const push = (endpoint: string): void => {
+    if (endpoint !== '' && !ordered.includes(endpoint)) ordered.push(endpoint);
+  };
+
+  try {
+    push(readCachedEndpoint(await ctx.store.get(CACHE_KEY_PREFERRED_MIRROR)) ?? '');
+  } catch {
+    // A broken store must not stop us from trying.
+  }
+
+  try {
+    for (const endpoint of await loadDiscoveredMirrors(ctx)) push(endpoint);
+  } catch {
+    // Discovery is a nicety; the static list still works.
+  }
+
+  for (const endpoint of ctx.fallbackMirrors) push(endpoint);
+  return ordered;
+}
+
+/** Move a working mirror to the front and remember it for next launch. */
+function rememberMirror(ctx: FetchContext, endpoint: string): void {
+  if (!ctx.discoverMirrors) return;
+  if (endpoint === '' || ctx.mirrors[0] === endpoint) return;
+  ctx.mirrors = [endpoint, ...ctx.mirrors.filter((item) => item !== endpoint)];
+  void ctx.store
+    .set(CACHE_KEY_PREFERRED_MIRROR, { endpoint, storedAt: ctx.now() } satisfies CachedMirror)
+    .catch(() => {
+      // Best-effort; the in-memory reorder already helped this run.
+    });
 }
 
 /**
@@ -387,12 +516,7 @@ async function loadCountryList(ctx: FetchContext): Promise<{
 async function loadCountryStations(countryCode: string, ctx: FetchContext): Promise<FetchOutcome> {
   const cacheKey = `${CACHE_KEY_COUNTRY_PREFIX}:${countryCode}:limit=${ctx.perCountry}:geo=${String(ctx.geoOnly)}:hidebroken=${String(ctx.hideBroken)}`;
 
-  const result = await readThrough<{
-    stations: Station[];
-    rejected: number;
-    endpoint: string;
-    fetchedAt: number;
-  }>({
+  const result = await readThrough<CachedStations>({
     store: ctx.store,
     key: cacheKey,
     ttlMs: ctx.ttlMs,
@@ -410,6 +534,7 @@ async function loadCountryStations(countryCode: string, ctx: FetchContext): Prom
       return {
         stations: normalised.stations,
         rejected: normalised.rejected,
+        filtered: normalised.filtered,
         endpoint: response.endpoint,
         fetchedAt: ctx.now(),
       };
@@ -419,6 +544,7 @@ async function loadCountryStations(countryCode: string, ctx: FetchContext): Prom
   return {
     stations: result.value.stations,
     rejected: result.value.rejected,
+    filtered: result.value.filtered,
     endpoint: result.value.endpoint,
     fromCache: result.fromCache,
     stale: result.stale,
@@ -434,12 +560,7 @@ async function loadPageByOffset(
 ): Promise<FetchOutcome> {
   const cacheKey = `${CACHE_KEY_PREFIX}:limit=${pageSize}:offset=${offset}:geo=${String(ctx.geoOnly)}:hidebroken=${String(ctx.hideBroken)}`;
 
-  const result = await readThrough<{
-    stations: Station[];
-    rejected: number;
-    endpoint: string;
-    fetchedAt: number;
-  }>({
+  const result = await readThrough<CachedStations>({
     store: ctx.store,
     key: cacheKey,
     ttlMs: ctx.ttlMs,
@@ -457,6 +578,7 @@ async function loadPageByOffset(
       return {
         stations: normalised.stations,
         rejected: normalised.rejected,
+        filtered: normalised.filtered,
         endpoint: response.endpoint,
         fetchedAt: ctx.now(),
       };
@@ -466,6 +588,7 @@ async function loadPageByOffset(
   return {
     stations: result.value.stations,
     rejected: result.value.rejected,
+    filtered: result.value.filtered,
     endpoint: result.value.endpoint,
     fromCache: result.fromCache,
     stale: result.stale,
@@ -480,10 +603,11 @@ export async function discoverStations(
     maxStations = DEFAULT_MAX_STATIONS,
     pageSize = DEFAULT_PAGE_SIZE,
     concurrency = DEFAULT_CONCURRENCY,
-    selection = 'top',
+    selection = 'by-country',
     countryCount = DEFAULT_COUNTRY_COUNT,
     perCountry = DEFAULT_PER_COUNTRY,
     countryConcurrency = DEFAULT_COUNTRY_CONCURRENCY,
+    snapshotUrl = DEFAULT_SNAPSHOT_URL,
     geoOnly = true,
     hideBroken = true,
     signal,
@@ -502,7 +626,10 @@ export async function discoverStations(
 
   const ctx: FetchContext = {
     store,
-    mirrors,
+    mirrors: [...mirrors],
+    fallbackMirrors: mirrors,
+    // Supplying `mirrors` explicitly means "use exactly these".
+    discoverMirrors: options.mirrors === undefined,
     ttlMs,
     now,
     timeoutMs,
@@ -516,10 +643,14 @@ export async function discoverStations(
     ...(onAttemptError ? { onAttemptError } : {}),
     ...(onStaleFallback ? { onStaleFallback } : {}),
   };
+  ctx.mirrors = await resolveMirrors(ctx);
 
-  const byId = new Map<string, Station>();
+  const liveById = new Map<string, Station>();
+  let snapshotStations: readonly Station[] = [];
+  let usedSnapshot = false;
   let failedUnits = 0;
   let rejected = 0;
+  let filtered = 0;
   let endpoint = '';
   let allFromCache = true;
   let anyStale = false;
@@ -532,24 +663,64 @@ export async function discoverStations(
   // for the other.
   const target = selection === 'by-country' ? countryCount * perCountry : maxStations;
 
+  /**
+   * What to show right now: the snapshot, with live data layered on top.
+   *
+   * Live wins on conflicts, so a station that moved appears at its new
+   * coordinates as soon as the real data lands.
+   */
+  const currentStations = (): Station[] => {
+    if (snapshotStations.length === 0) {
+      return [...liveById.values()].sort(compareStations).slice(0, maxStations);
+    }
+    const merged = new Map<string, Station>();
+    for (const station of snapshotStations) merged.set(station.id, station);
+    for (const [id, station] of liveById) merged.set(id, station);
+    return [...merged.values()].sort(compareStations).slice(0, maxStations);
+  };
+
+  const emit = (): void => {
+    const stations = currentStations();
+    onPage?.(stations, { loaded: stations.length, target, failed: failedUnits });
+  };
+
   const absorb = (outcome: FetchOutcome): void => {
+    rememberMirror(ctx, outcome.endpoint);
     for (const station of outcome.stations) {
-      if (!byId.has(station.id)) byId.set(station.id, station);
+      if (!liveById.has(station.id)) liveById.set(station.id, station);
     }
     if (endpoint === '') endpoint = outcome.endpoint;
     allFromCache = allFromCache && outcome.fromCache;
     anyStale = anyStale || outcome.stale;
     fetchedAt = Math.max(fetchedAt, outcome.fetchedAt);
     rejected += outcome.rejected;
+    filtered += outcome.filtered;
     completed += 1;
-    onPage?.([...byId.values()], { loaded: byId.size, target, failed: failedUnits });
+    emit();
   };
 
   const recordFailure = (): void => {
     failedUnits += 1;
     completed += 1;
-    onPage?.([...byId.values()], { loaded: byId.size, target, failed: failedUnits });
+    emit();
   };
+
+  // Provisional snapshot, so the globe has pins before the network answers.
+  // Records go through the same parser and mapper as live responses.
+  if (snapshotUrl !== null) {
+    const snapshot = await loadSnapshot(snapshotUrl, now, fetchImpl ?? fetch);
+    if (snapshot) {
+      const normalised = normaliseStations(snapshot.records);
+      if (normalised.stations.length > 0) {
+        snapshotStations = normalised.stations;
+        usedSnapshot = true;
+        filtered += normalised.filtered;
+        rejected += normalised.rejected;
+        fetchedAt = Math.max(fetchedAt, snapshot.ageMs === null ? 0 : now() - snapshot.ageMs);
+        emit();
+      }
+    }
+  }
 
   if (selection === 'by-country') {
     const list = await loadCountryList(ctx);
@@ -587,12 +758,16 @@ export async function discoverStations(
     });
   }
 
-  // Every request failed and we collected nothing — that is a real failure.
-  if (completed > 0 && completed === failedUnits) {
+  // Every request failed. With a snapshot we still have a usable globe, so only
+  // a total outage with nothing to fall back on is an error.
+  if (completed > 0 && completed === failedUnits && snapshotStations.length === 0) {
     throw new SourceError('no-mirror', `All ${failedUnits} request(s) failed`);
   }
 
-  const stations = [...byId.values()].sort(compareStations).slice(0, maxStations);
+  const stations =
+    liveById.size > 0
+      ? [...liveById.values()].sort(compareStations).slice(0, maxStations)
+      : [...snapshotStations].sort(compareStations).slice(0, maxStations);
 
   const meta: DiscoveryMeta = {
     sourceId: SOURCE_ID,
@@ -603,6 +778,8 @@ export async function discoverStations(
     failedPages: failedUnits,
     totalPages: totalUnits,
     rejectedStations: rejected,
+    filteredStations: filtered,
+    fromSnapshot: usedSnapshot && liveById.size === 0,
   };
 
   return { stations, meta };
